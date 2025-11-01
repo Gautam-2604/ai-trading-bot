@@ -1,20 +1,112 @@
-import { CandlestickApi, IsomorphicFetchHttpLibrary, ServerConfiguration } from "./lighter-sdk-ts/generated";
-const BASE_URL = "https://mainnet.zklighter.elliot.ai"
-const SOL_MARKET_ID = 2
+import { createOpenRouter } from '@openrouter/ai-sdk-provider';
+import { streamText } from 'ai';
+import {  z } from 'zod';
+import { PROMPT } from './prompts';
+import { type Account } from './accounts';
+import { getOpenPositions } from './openPositions';
+import { MARKETS } from './markets';
+import { createPosition } from './createPosition';
+import { cancelAllOrders } from './cancelOrder';
+import { PrismaClient, ToolCallType } from './generated/prisma/client';
+import { getPortfolio } from './getPortfolio';
+const prisma = new PrismaClient();
 
-async function getKlines(marketId: number) {
-    const klinesApi = new CandlestickApi({
-        baseServer: new ServerConfiguration<{  }>(BASE_URL, {  }),
-        httpApi: new IsomorphicFetchHttpLibrary(),
-        middleware: [],
-        authMethods: {}
-    });
+export const invokeAgent = async (account: Account) => {
+  const openrouter = createOpenRouter({
+    apiKey: process.env['OPENROUTER_API_KEY'] ?? '',
+  });
 
-    const klines = await klinesApi.candlesticks(SOL_MARKET_ID, '1m', Date.now() - 1000 * 60 * 60 * 1, Date.now(), 50, false);
-    const midPrices = klines.candlesticks.slice(-10).map(({open, close})=>
-        (open+close)/2
-    )
-    console.log(midPrices);
+  let ALL_INDICATOR_DATA = "";
+  
+  
+  const portfolio = await getPortfolio(account);
+
+  const openPositions = await getOpenPositions(account.apiKey, account.accountIndex);
+  const modelInvocation = await prisma.invocations.create({
+    data: {
+      modelId: account.id,
+      response: "",
+    },
+  });
+  const enrichedPrompt = PROMPT.replace("{{INVOKATION_TIMES}}", account.invocationCount.toString())
+  .replace("{{OPEN_POSITIONS}}", openPositions?.map((position) => `${position.symbol} ${position.position} ${position.sign}`).join(", ") ?? "")
+  .replace("{{PORTFOLIO_VALUE}}", `$${portfolio.total}`)
+  .replace("{{ALL_INDICATOR_DATA}}", ALL_INDICATOR_DATA)
+  .replace("{{AVAILABLE_CASH}}", `$${portfolio.available}`)
+  .replace("{{CURRENT_ACCOUNT_VALUE}}", `$${portfolio.total}`)
+  .replace("{{CURRENT_ACCOUNT_POSITIONS}}", JSON.stringify(openPositions))
+
+  console.log(enrichedPrompt)
+
+  const response = streamText({
+    model: openrouter(account.modelName),
+    prompt: enrichedPrompt,
+    tools: {
+      createPosition: {
+        description: 'Open a position in the given market',
+        inputSchema: z.object({
+          symbol: z.enum(Object.keys(MARKETS)).describe('The symbol to open the position at'),
+          side: z.enum(["LONG", "SHORT"]),
+          quantity: z.number().describe('The quantity of the position to open.'),
+        }),
+        execute: async ({ symbol, side, quantity }) => {
+          await createPosition(account, symbol, side, quantity);
+          await prisma.toolCalls.create({
+            data: {
+              invocationId: modelInvocation.id,
+              toolCallType: ToolCallType.CREATE_POSITION,
+              metadata: JSON.stringify({ symbol, side, quantity }),
+            },
+          });
+          return `Position opened successfully for ${quantity} ${symbol}`;
+        },
+      },
+      closeAllPosition: {
+        description: 'Close all the currently open positions',
+        inputSchema: z.object({}),
+        execute: async () => {
+          await cancelAllOrders(account);
+          await prisma.toolCalls.create({
+            data: {
+              invocationId: modelInvocation.id,
+              toolCallType: ToolCallType.CLOSE_POSITION,
+              metadata: "",
+            },
+          });
+          console.log(`All positions closed successfully`);
+          return `All positions closed successfully`;
+        },
+      },
+    },
+  });
+
+  await response.consumeStream();
+  await prisma.models.update({
+    where: { id: account.id },
+    data: { invocationCount: { increment: 1 } },
+  });
+  await prisma.invocations.update({
+    where: { id: modelInvocation.id },
+    data: { response: (await response.text).trim() },
+  });
+  return response.text;
+};
+
+async function main() {
+    const models = await prisma.models.findMany();
+
+    for (const model of models) {
+        await invokeAgent({
+            apiKey: model.lighterApiKey,
+            modelName: model.openRoutermodelName,
+            name: model.name,
+            invocationCount: model.invocationCount,
+            id: model.id,
+            accountIndex: model.accountIndex
+        });
+    }
 }
 
-getKlines(SOL_MARKET_ID);
+setInterval(() => {
+    main()
+}, 1000 * 60 * 5);

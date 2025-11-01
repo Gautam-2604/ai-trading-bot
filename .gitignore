@@ -174,3 +174,4 @@ dist
 
 
 lighter-sdk-ts
+/generated/prisma
